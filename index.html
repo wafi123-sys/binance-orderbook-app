@@ -1124,7 +1124,11 @@ function switchSymbol(sym) {
 
   // Clear depth canvas
   const c = document.getElementById('depthChart');
-  c.getContext('2d').clearRect(0, 0, c.width, c.height);
+  if (c) c.getContext('2d').clearRect(0, 0, c.width, c.height);
+
+  // Clear heatmap canvas
+  const hc = document.getElementById('heatmapChart');
+  if (hc) hc.getContext('2d').clearRect(0, 0, hc.width, hc.height);
 
   // Update pill
   if (allCoins[sym]) updatePill(allCoins[sym]);
@@ -2039,7 +2043,11 @@ function saveSmState(sym) {
     smBuy, smSell, smNeutral,
     currentPhase,
     marketMemory: new Map(marketMemory),
-    absVolBuy, absVolSell, absStartP
+    absVolBuy, absVolSell, absStartP,
+    priceHistory90s: [...priceHistory90s],
+    tradesFreqHistory: [...tradesFreqHistory],
+    lastIgnitionTime,
+    latestTradeP
   });
 }
 
@@ -2058,6 +2066,10 @@ function loadSmState(sym) {
     absVolBuy = saved.absVolBuy;
     absVolSell = saved.absVolSell;
     absStartP = saved.absStartP;
+    priceHistory90s = saved.priceHistory90s;
+    tradesFreqHistory = saved.tradesFreqHistory;
+    lastIgnitionTime = saved.lastIgnitionTime;
+    latestTradeP = saved.latestTradeP;
   } else {
     // Fresh state for new coin
     timelineEvents = [];
@@ -2066,6 +2078,10 @@ function loadSmState(sym) {
     currentPhase = 'OBSERVING';
     marketMemory.clear();
     absVolBuy = 0; absVolSell = 0; absStartP = 0;
+    priceHistory90s = [];
+    tradesFreqHistory = [];
+    lastIgnitionTime = 0;
+    latestTradeP = allCoins[sym] ? allCoins[sym].price : 0;
   }
   renderSmartMoneyScores();
   renderTimeline();
