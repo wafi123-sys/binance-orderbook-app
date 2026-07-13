@@ -239,11 +239,17 @@
     /* ====== MAIN AREA ====== */
     .main-area {
       flex: 1; display: grid;
-      grid-template-columns: 360px 1fr;
+      grid-template-columns: 340px 1fr 340px;
       gap: 0; overflow: hidden;
     }
 
     .main-left {
+      border-right: 1px solid var(--border);
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+
+    .main-middle {
       border-right: 1px solid var(--border);
       display: flex; flex-direction: column;
       overflow: hidden;
@@ -584,35 +590,51 @@
           </div>
         </div>
 
-        <!-- DEPTH CHART / HEATMAP -->
-        <div class="card" style="flex:1;">
-          <div class="card-header" style="padding-bottom:5px;">
-            <div class="card-title" style="display:flex; gap:15px; font-size:13px;">
-              <button class="view-tab active" data-view="depth">&#128200; Cumulative Depth</button>
-              <button class="view-tab" data-view="heatmap">&#128293; Liquidity Heatmap</button>
-            </div>
           </div>
-          <!-- DEPTH CHART CONTROLS -->
-          <div class="ctrl-bar" id="depthChartCtrlBar">
-            <span class="ctrl-label">Levels</span>
-            <div class="ctrl-group" id="depthChartCtrl">
-              <button class="ctrl-btn" data-dlvl="5">5</button>
-              <button class="ctrl-btn" data-dlvl="10">10</button>
-              <button class="ctrl-btn active" data-dlvl="20">20</button>
-              <button class="ctrl-btn" data-dlvl="50">50</button>
-              <button class="ctrl-btn" data-dlvl="100">100</button>
-              <button class="ctrl-btn" data-dlvl="500">500</button>
-            </div>
-            <div class="ctrl-sep"></div>
-            <span class="ctrl-label">Zoom</span>
-            <input type="range" class="depth-range" id="depthZoom" min="10" max="100" value="100" step="5" title="Zoom: trim outer % of price range" />
-            <span class="depth-range-val" id="depthZoomVal">100%</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- MIDDLE: CHARTS (TradingView + Depth/Heatmap) -->
+    <div class="main-middle">
+      <!-- TRADING VIEW CARD -->
+      <div class="card" style="flex:3; display:flex; flex-direction:column; min-height:300px;">
+        <div class="card-header" style="padding: 6px 14px;">
+          <div class="card-title">&#128200; TradingView Chart</div>
+        </div>
+        <div style="flex:1; width:100%; position:relative;">
+          <div id="tradingview_chart" style="position:absolute; top:0; left:0; right:0; bottom:0;"></div>
+        </div>
+      </div>
+
+      <!-- DEPTH CHART / HEATMAP CARD -->
+      <div class="card" style="flex:2; display:flex; flex-direction:column; min-height: 200px;">
+        <div class="card-header" style="padding-bottom:5px;">
+          <div class="card-title" style="display:flex; gap:15px; font-size:13px;">
+            <button class="view-tab active" data-view="depth">&#128200; Cumulative Depth</button>
+            <button class="view-tab" data-view="heatmap">&#128293; Liquidity Heatmap</button>
           </div>
-          <div class="depth-wrap" style="position:relative;">
-            <canvas id="depthChart" height="140"></canvas>
-            <canvas id="heatmapChart" height="140" style="display:none; width:100%; height:140px; background:#000; border-radius:4px;"></canvas>
-            <div id="heatmapOverlay" style="display:none; position:absolute; top:0; left:0; width:100%; height:100%; overflow:hidden; pointer-events:none; border-radius:4px;"></div>
+        </div>
+        <!-- DEPTH CHART CONTROLS -->
+        <div class="ctrl-bar" id="depthChartCtrlBar">
+          <span class="ctrl-label">Levels</span>
+          <div class="ctrl-group" id="depthChartCtrl">
+            <button class="ctrl-btn" data-dlvl="5">5</button>
+            <button class="ctrl-btn" data-dlvl="10">10</button>
+            <button class="ctrl-btn active" data-dlvl="20">20</button>
+            <button class="ctrl-btn" data-dlvl="50">50</button>
+            <button class="ctrl-btn" data-dlvl="100">100</button>
+            <button class="ctrl-btn" data-dlvl="500">500</button>
           </div>
+          <div class="ctrl-sep"></div>
+          <span class="ctrl-label">Zoom</span>
+          <input type="range" class="depth-range" id="depthZoom" min="10" max="100" value="100" step="5" title="Zoom: trim outer % of price range" />
+          <span class="depth-range-val" id="depthZoomVal">100%</span>
+        </div>
+        <div class="depth-wrap" style="position:relative; flex:1;">
+          <canvas id="depthChart" style="position:absolute; top:0; left:0; width:100%; height:100%; border-radius:4px;"></canvas>
+          <canvas id="heatmapChart" style="display:none; position:absolute; top:0; left:0; width:100%; height:100%; background:#000; border-radius:4px;"></canvas>
+          <div id="heatmapOverlay" style="display:none; position:absolute; top:0; left:0; width:100%; height:100%; overflow:hidden; pointer-events:none; border-radius:4px;"></div>
         </div>
       </div>
     </div>
@@ -775,7 +797,40 @@
   </div>
 </div>
 
+<!-- TRADINGVIEW SCRIPT -->
+<script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+
 <script>
+// ==============================================
+// TRADINGVIEW WIDGET
+// ==============================================
+let tvWidget = null;
+function initTVChart(sym) {
+  const tvSym = sym.toUpperCase().replace('USDT', 'USDT');
+  const container = document.getElementById('tradingview_chart');
+  if (!container) return;
+  container.innerHTML = ''; // Clear previous widget
+  tvWidget = new TradingView.widget({
+    "autosize": true,
+    "symbol": "BINANCE:" + tvSym,
+    "interval": "15",
+    "timezone": "Etc/UTC",
+    "theme": "dark",
+    "style": "1",
+    "locale": "en",
+    "enable_publishing": false,
+    "backgroundColor": "#0b101e",
+    "gridColor": "rgba(30,42,69,0.5)",
+    "hide_top_toolbar": false,
+    "hide_legend": false,
+    "save_image": false,
+    "container_id": "tradingview_chart",
+    "toolbar_bg": "#0b101e"
+  });
+}
+
+// ... existing code down below
+
 // ==============================================
 // STATE
 // ==============================================
@@ -1158,6 +1213,8 @@ function switchSymbol(sym) {
 
   // Load saved SM state for new coin (or fresh if first visit)
   loadSmState(sym);
+
+  initTVChart(sym);
 
   connectDepth(sym);
   connectTradesWS(sym);
