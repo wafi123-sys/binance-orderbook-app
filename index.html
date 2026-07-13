@@ -821,9 +821,59 @@ let timelineEvents = [];
 const MAX_EVENTS = 30;
 let absVolBuy = 0, absVolSell = 0;
 let absStartP = 0;
-let activeWalls = new Map(); // price -> { qty, side, firstSeen }
-const WALL_THRESHOLD_USD = 250000; // $250k USD for a wall
+let activeWalls = new Map(); // price -> { qty, side, firstSeen, bornDuringStagnation }
 let use100ms = true; // For depth stream fallback
+
+// --- Adaptive Thresholds & Memory ---
+let priceHistory90s = []; // {price, time}
+let tradesFreqHistory = []; // {isBuy, qty, time, usd}
+let lastIgnitionTime = 0;
+
+const VOL_TIERS = [
+  { minVol: 1e9, wallUsd: 1500000, whaleUsd: 500000, spoofWindowMs: 25000, absorbWindowMs: 15000, migrationPct: 0.05, refillTolerance: 0.1 },
+  { minVol: 5e8, wallUsd: 800000,  whaleUsd: 250000, spoofWindowMs: 20000, absorbWindowMs: 10000, migrationPct: 0.04, refillTolerance: 0.15 },
+  { minVol: 1e8, wallUsd: 300000,  whaleUsd: 100000, spoofWindowMs: 15000, absorbWindowMs: 8000,  migrationPct: 0.03, refillTolerance: 0.2 },
+  { minVol: 5e7, wallUsd: 150000,  whaleUsd: 50000,  spoofWindowMs: 10000, absorbWindowMs: 6000,  migrationPct: 0.02, refillTolerance: 0.25 },
+  { minVol: 1e7, wallUsd: 50000,   whaleUsd: 20000,  spoofWindowMs: 8000,  absorbWindowMs: 5000,  migrationPct: 0.02, refillTolerance: 0.3 },
+  { minVol: 0,   wallUsd: 20000,   whaleUsd: 5000,   spoofWindowMs: 5000,  absorbWindowMs: 4000,  migrationPct: 0.015, refillTolerance: 0.4 }
+];
+
+function getAdaptiveThresholds() {
+  const coin = allCoins[currentSymbol];
+  const vol = coin ? coin.vol : 0;
+  for (const tier of VOL_TIERS) {
+    if (vol >= tier.minVol) return tier;
+  }
+  return VOL_TIERS[VOL_TIERS.length - 1];
+}
+
+function updatePriceHistory() {
+  const now = Date.now();
+  if (latestTradeP > 0) priceHistory90s.unshift({ price: latestTradeP, time: now });
+  priceHistory90s = priceHistory90s.filter(p => now - p.time <= 90000);
+}
+
+function isPriceStagnant() {
+  if (priceHistory90s.length < 10) return false;
+  const prices = priceHistory90s.map(p => p.price);
+  const min = Math.min(...prices);
+  const max = Math.max(...prices);
+  return (max - min) / min < 0.0025; // 0.25% range over 90s = stagnant
+}
+
+function executedVolumeNear(price, timeWindowMs, isBuy) {
+  const now = Date.now();
+  let vol = 0;
+  for (const t of trades) {
+    if (now - t.time > timeWindowMs) break; 
+    if (Math.abs(t.price - price) / price < 0.0015) {
+      if (isBuy === undefined || t.isBuy === isBuy) {
+        vol += t.price * t.qty;
+      }
+    }
+  }
+  return vol;
+}
 
 // ==============================================
 // FORMATTERS
@@ -1216,57 +1266,109 @@ function processOrderBook() {
 
   // --- SMART MONEY WALL TRACKER ---
   if (latestTradeP > 0) {
+    updatePriceHistory();
+    const thresholds = getAdaptiveThresholds();
+    const stagnant = isPriceStagnant();
+    
     const currentWalls = new Map();
     for (const [p, q] of orderBookMap.asks.entries()) {
-      if (p * q > WALL_THRESHOLD_USD) currentWalls.set(p, { qty: q, side: 'ask', time: now });
+      if (p * q > thresholds.wallUsd) currentWalls.set(p, { qty: q, side: 'ask', time: now });
     }
     for (const [p, q] of orderBookMap.bids.entries()) {
-      if (p * q > WALL_THRESHOLD_USD) currentWalls.set(p, { qty: q, side: 'bid', time: now });
+      if (p * q > thresholds.wallUsd) currentWalls.set(p, { qty: q, side: 'bid', time: now });
     }
 
+    const missingWalls = [];
     for (const [p, oldWall] of activeWalls.entries()) {
-      if (!currentWalls.has(p)) {
-        const livedFor = now - oldWall.firstSeen;
-        const isSwept = Math.abs(latestTradeP - p) / p < 0.002; // within 0.2% of trade
-        
-        if (isSwept) {
-          // ASK wall swept = bearish (price broke below ask wall = sellers won)
-          // BID wall swept = bullish (price broke above bid wall = buyers won)
-          const side = oldWall.side; // 'ask' or 'bid'
-          classifyAndPush(side === 'bid' ? 'SWEEP_BID' : 'SWEEP_ASK', {
-            desc: `${side.toUpperCase()} wall at ${fmtP(p)} swept`,
-            usdtVal: p * oldWall.qty,
-            side
-          });
-        } else {
-          let migratedTo = null;
-          for (const [np, newWall] of currentWalls.entries()) {
-            if (!activeWalls.has(np) && newWall.side === oldWall.side) {
-              if (Math.abs(np - p) / p < 0.02) { migratedTo = np; break; }
-            }
+      if (!currentWalls.has(p)) missingWalls.push({ p, ...oldWall });
+    }
+
+    // Phase 2: Layering Detection
+    const layeringAsks = missingWalls.filter(w => w.side === 'ask');
+    const layeringBids = missingWalls.filter(w => w.side === 'bid');
+    
+    function detectLayeringGroup(missingGroup) {
+      if (missingGroup.length >= 3) {
+        const minP = Math.min(...missingGroup.map(w => w.p));
+        const maxP = Math.max(...missingGroup.map(w => w.p));
+        if ((maxP - minP) / minP <= 0.006) {
+          let totalExec = 0;
+          let totalWall = 0;
+          for (const w of missingGroup) {
+            totalWall += w.p * w.qty;
+            totalExec += executedVolumeNear(w.p, 6000, w.side === 'ask' ? true : false); 
           }
-          if (migratedTo) {
-            classifyAndPush('MIGRATION', {
-              desc: `Wall moved ${fmtP(p)} ➔ ${fmtP(migratedTo)}`,
-              usdtVal: p * oldWall.qty,
-              side: oldWall.side
-            });
-          } else if (livedFor < 15000) {
+          if (totalExec / totalWall < 0.2) return true;
+        }
+      }
+      return false;
+    }
+
+    const isLayeringAsk = detectLayeringGroup(layeringAsks);
+    if (isLayeringAsk) {
+      classifyAndPush('LAYERING_ASK', {
+        desc: `Simultaneous cancel of 3+ ask walls (Layering)`,
+        usdtVal: layeringAsks.reduce((sum, w) => sum + (w.p * w.qty), 0),
+        side: 'ask', execRatio: 0
+      });
+    }
+    const isLayeringBid = detectLayeringGroup(layeringBids);
+    if (isLayeringBid) {
+      classifyAndPush('LAYERING_BID', {
+        desc: `Simultaneous cancel of 3+ bid walls (Layering)`,
+        usdtVal: layeringBids.reduce((sum, w) => sum + (w.p * w.qty), 0),
+        side: 'bid', execRatio: 0
+      });
+    }
+
+    for (const w of missingWalls) {
+      const { p } = w;
+      const livedFor = now - w.firstSeen;
+      const isSwept = Math.abs(latestTradeP - p) / p < 0.002; 
+      const execVol = executedVolumeNear(p, 6000, w.side === 'ask' ? true : false);
+      const wallUsd = p * w.qty;
+      const execRatio = wallUsd > 0 ? execVol / wallUsd : 0;
+
+      // Trap Detection
+      let isTrap = false;
+      if (w.bornDuringStagnation && livedFor < 20000 && isSwept && execRatio >= 0.1) {
+        isTrap = true;
+      }
+
+      if (isSwept && execRatio >= 0.1) {
+        const side = w.side; 
+        classifyAndPush(side === 'bid' ? 'SWEEP_BID' : 'SWEEP_ASK', {
+          desc: `${side.toUpperCase()} wall at ${fmtP(p)} swept${isTrap ? ' (⚠️ TRAP)' : ''}`,
+          usdtVal: wallUsd, side, execRatio, livedFor
+        });
+      } else {
+        let migratedTo = null;
+        for (const [np, newWall] of currentWalls.entries()) {
+          if (!activeWalls.has(np) && newWall.side === w.side) {
+            if (Math.abs(np - p) / p < thresholds.migrationPct) { migratedTo = np; break; }
+          }
+        }
+        if (migratedTo) {
+          classifyAndPush('MIGRATION', {
+            desc: `Wall moved ${fmtP(p)} ➔ ${fmtP(migratedTo)}`,
+            usdtVal: wallUsd, side: w.side, execRatio, livedFor
+          });
+        } else if (livedFor < thresholds.spoofWindowMs) {
+          const partOfLayering = (w.side === 'ask' && isLayeringAsk) || (w.side === 'bid' && isLayeringBid);
+          if (!partOfLayering) {
             classifyAndPush('SPOOF', {
               desc: `Fake wall at ${fmtP(p)} vanished`,
-              usdtVal: p * oldWall.qty,
-              side: oldWall.side
+              usdtVal: wallUsd, side: w.side, execRatio, livedFor
             });
           }
         }
       }
+      activeWalls.delete(p);
     }
+
     for (const [p, w] of currentWalls.entries()) {
-      if (!activeWalls.has(p)) activeWalls.set(p, { qty: w.qty, side: w.side, firstSeen: now });
+      if (!activeWalls.has(p)) activeWalls.set(p, { qty: w.qty, side: w.side, firstSeen: now, bornDuringStagnation: stagnant });
       else activeWalls.get(p).qty = w.qty;
-    }
-    for (const p of activeWalls.keys()) {
-      if (!currentWalls.has(p)) activeWalls.delete(p);
     }
   }
   // --------------------------------
@@ -1338,6 +1440,7 @@ function connectTradesWS(sym) {
   wsTrades.onmessage = (e) => {
     const d = JSON.parse(e.data);
     const price = +d.p, qty = +d.q, isBuy = !d.m;
+    const now = Date.now();
     trades.unshift({ price, qty, isBuy, time: d.T });
     if (trades.length > MAX_TRADES) trades.pop();
     
@@ -1346,9 +1449,36 @@ function connectTradesWS(sym) {
     if (absStartP === 0) absStartP = price;
 
     const usdtValue = price * qty;
+    const thresholds = getAdaptiveThresholds();
+
+    // Phase 3: Momentum Ignition
+    tradesFreqHistory.unshift({ isBuy, qty, time: now, usd: usdtValue });
+    tradesFreqHistory = tradesFreqHistory.filter(t => now - t.time <= 60000);
+
+    const t4s = tradesFreqHistory.filter(t => now - t.time <= 4000);
+    if (t4s.length >= 15) {
+      const freq60s = tradesFreqHistory.length / 60;
+      const freq4s = t4s.length / 4;
+      if (freq4s > freq60s * 2.5) {
+        const buyCount = t4s.filter(t=>t.isBuy).length;
+        const buyRatio = buyCount / t4s.length;
+        const avgUsd = t4s.reduce((s,t)=>s+t.usd,0) / t4s.length;
+        
+        if (avgUsd < thresholds.whaleUsd * 0.5 && (buyRatio > 0.8 || buyRatio < 0.2)) {
+          if (now - lastIgnitionTime > 10000) {
+            lastIgnitionTime = now;
+            classifyAndPush('MOMENTUM_IGNITION', {
+              desc: `High-freq retail orders driving price ${buyRatio > 0.8 ? 'UP' : 'DOWN'}`,
+              usdtVal: t4s.reduce((s,t)=>s+t.usd,0),
+              side: buyRatio > 0.8 ? 'buy' : 'sell'
+            });
+          }
+        }
+      }
+    }
 
     // Whale Radar — feed directly into Intelligence Engine
-    if (usdtValue > 100000) {
+    if (usdtValue > thresholds.whaleUsd) {
       classifyAndPush(isBuy ? 'WHALE_BUY' : 'WHALE_SELL', {
         desc: `${fmtQ(qty)} @ ${fmtP(price)}`,
         usdtVal: usdtValue
@@ -1960,27 +2090,55 @@ function stars(rawType) {
 }
 
 // Layer 4: Confidence Engine
-function calcConfidence(rawType) {
+function calcConfidence(rawType, data) {
+  const thresholds = getAdaptiveThresholds();
+  let conf = 65;
   const base = {
-    WHALE_BUY:88,WHALE_SELL:88,SWEEP_BID:84,SWEEP_ASK:84,ABSORPTION:84,
-    ACCUMULATION:80,DISTRIBUTION:80,SPOOF:38,MIGRATION:66,
-    STOP_HUNT:72,LIQUIDITY_SHIFT:64
+    WHALE_BUY:80, WHALE_SELL:80, SWEEP_BID:75, SWEEP_ASK:75, ABSORPTION:80,
+    ACCUMULATION:85, DISTRIBUTION:85, SPOOF:50, MIGRATION:60,
+    STOP_HUNT:75, LAYERING_ASK:80, LAYERING_BID:80, MOMENTUM_IGNITION:75, STOP_HUNT_ENGINEERED:95
   };
-  return (base[rawType] || 65) + Math.floor(Math.random()*9);
+  conf = base[rawType] || 65;
+  
+  if (data) {
+    if (data.execRatio !== undefined) {
+      if (data.execRatio > 0.8) conf += 15;
+      else if (data.execRatio > 0.5) conf += 10;
+      else if (data.execRatio < 0.1 && (rawType==='SPOOF' || rawType.startsWith('LAYERING'))) conf += 15;
+    }
+    if (data.livedFor !== undefined) {
+      if (data.livedFor > 60000) conf += 10;
+      else if (data.livedFor < 5000 && rawType==='SPOOF') conf += 10;
+    }
+    if (data.usdtVal !== undefined) {
+      if (data.usdtVal > thresholds.wallUsd * 2) conf += 10;
+      else if (data.usdtVal > thresholds.wallUsd) conf += 5;
+    }
+  }
+  return Math.min(99, Math.max(1, Math.floor(conf)));
 }
 
 // Layer 10: Pattern Library
 const PATTERNS = [
-  { name:'ACCUMULATION', requires:['WHALE_BUY','ABSORPTION','SWEEP'], conf:91, desc:'Institutional Accumulation Sequence' },
+  { name:'ACCUMULATION', requires:['WHALE_BUY','ABSORPTION','SWEEP_ASK'], conf:91, desc:'Institutional Accumulation Sequence' },
   { name:'DISTRIBUTION', requires:['WHALE_SELL','MIGRATION'], conf:84, desc:'Smart Money Distribution' },
   { name:'STOP_HUNT',   requires:['SPOOF','WHALE_BUY'],      conf:72, desc:'Stop Hunt → Position Entry' },
+  { name:'STOP_HUNT_ENGINEERED', requires:['LAYERING_ASK','MOMENTUM_IGNITION','SWEEP_BID','WHALE_BUY'], conf:95, desc:'Engineered Stop Hunt (Layering → Momentum → Sweep)' },
+  { name:'STOP_HUNT_ENGINEERED', requires:['LAYERING_BID','MOMENTUM_IGNITION','SWEEP_ASK','WHALE_SELL'], conf:95, desc:'Engineered Stop Hunt (Layering → Momentum → Sweep)' },
   { name:'ACCUMULATION',requires:['ABSORPTION','ABSORPTION'], conf:85, desc:'Repeated Absorption = Accumulation' },
   { name:'DISTRIBUTION',requires:['WHALE_SELL','WHALE_SELL'], conf:82, desc:'Repeated Whale Sells = Distribution' },
 ];
 
-function detectPattern(recentTypes) {
+function detectPattern(recentEvents) {
   for (const p of PATTERNS) {
-    if (p.requires.every(r => recentTypes.includes(r))) return p;
+    let matchIdx = 0;
+    let required = p.requires;
+    for (let i = recentEvents.length - 1; i >= 0; i--) {
+      if (recentEvents[i].rawType === required[matchIdx]) {
+        matchIdx++;
+        if (matchIdx === required.length) return p;
+      }
+    }
   }
   return null;
 }
@@ -1989,12 +2147,15 @@ function detectPattern(recentTypes) {
 function buildNarrative(types) {
   const price = latestTradeP > 0 ? fmtP(latestTradeP) : '—';
   let story = '';
-  if (types.includes('ACCUMULATION')) story = `Pola akumulasi institusional terdeteksi di ${price}. Terdapat penyerapan volume tinggi dan tekanan beli yang sistematis. Likuiditas beli sedang dibangun secara terstruktur.`;
+  if (types.includes('STOP_HUNT_ENGINEERED')) story = `Engineered Stop Hunt terdeteksi! Smart money memancing ritel dengan layering dan momentum buatan, menyapu stop-loss, lalu masuk posisi di harga terbaik.`;
+  else if (types.includes('ACCUMULATION')) story = `Pola akumulasi institusional terdeteksi di ${price}. Terdapat penyerapan volume tinggi dan tekanan beli yang sistematis. Likuiditas beli sedang dibangun secara terstruktur.`;
   else if (types.includes('DISTRIBUTION')) story = `Pola distribusi terdeteksi di ${price}. Pelaku besar tampak melepas posisi ke pembeli ritel. Waspadai potensi pembalikan ke bawah.`;
   else if (types.includes('STOP_HUNT')) story = `Pola stop hunt terdeteksi. Harga bergerak melampaui level kritis, menyapu stop order sebelum berbalik. Cermati arah selanjutnya.`;
   else if (types.includes('ABSORPTION') && types.includes('WHALE_BUY')) story = `Penyerapan kuat di ${price}. Tekanan jual besar diserap oleh buyer besar. Open Interest kemungkinan meningkat. Peluang breakout ke atas meningkat.`;
+  else if (types.includes('LAYERING_ASK') || types.includes('LAYERING_BID')) story = `Aktivitas layering terdeteksi di ${price}. Tembok palsu ditarik secara massal tanpa eksekusi, kemungkinan spoofing tingkat lanjut untuk mengontrol arah harga.`;
+  else if (types.includes('MOMENTUM_IGNITION')) story = `Momentum ignition (Pancingan Momentum) terdeteksi. Order kecil frekuensi tinggi menekan harga, mencoba memicu algoritma HFT atau FOMO ritel.`;
   else if (types.includes('SPOOF')) story = `Order besar muncul dan hilang sebelum tereksekusi di ${price}. Kemungkinan spoofing untuk menggerakkan sentimen. Hati-hati dengan sinyal semu.`;
-  else if (types.includes('SWEEP')) story = `Tembok likuiditas disapu di ${price}. Smart money mengeksekusi order besar melawan dinding, membersihkan area untuk pergerakan berikutnya.`;
+  else if (types.includes('SWEEP_ASK') || types.includes('SWEEP_BID')) story = `Tembok likuiditas disapu di ${price}. Smart money mengeksekusi order besar melawan dinding, membersihkan area untuk pergerakan berikutnya.`;
   else if (types.includes('WHALE_BUY')) story = `Pembelian besar terdeteksi di ${price}. Smart money mengambil posisi long dengan volume signifikan. Keyakinan tinggi pada level ini.`;
   else if (types.includes('WHALE_SELL')) story = `Penjualan besar terdeteksi di ${price}. Smart money melepas posisi. Perhatikan tekanan jual lanjutan.`;
   else if (types.includes('MIGRATION')) story = `Likuiditas bermigrasi ke level baru. Pelaku besar memindahkan dinding order — kemungkinan mempersiapkan pergerakan besar.`;
@@ -2026,7 +2187,7 @@ function renderSmartMoneyScores() {
 function classifyAndPush(rawType, data) {
   const ts = Date.now();
   const timeStr = new Date().toTimeString().slice(0, 8);
-  const confidence = calcConfidence(rawType);
+  const confidence = calcConfidence(rawType, data);
 
   const ev = { rawType, data, ts, timeStr, confidence, price: latestTradeP };
   CLASSIFIED_EVENTS.unshift(ev);
@@ -2046,7 +2207,7 @@ function classifyAndPush(rawType, data) {
   const windowStart = ts - STORY_WINDOW_MS;
   const recent = CLASSIFIED_EVENTS.filter(e => e.ts > windowStart);
   const recentTypes = recent.map(e => e.rawType);
-  const pattern = detectPattern(recentTypes);
+  const pattern = detectPattern(recent);
 
   // Layer 7: Score Update — side-aware!
   // SWEEP_BID = bid wall swept by sellers → bearish
@@ -2062,7 +2223,8 @@ function classifyAndPush(rawType, data) {
   // Layer 8: Phase Detection
   const tot = smBuy + smSell + smNeutral || 1;
   const br = smBuy / tot, sr = smSell / tot;
-  if (pattern && pattern.name === 'ACCUMULATION') currentPhase = 'ACCUMULATION';
+  if (pattern && pattern.name === 'STOP_HUNT_ENGINEERED') currentPhase = 'STOP HUNT';
+  else if (pattern && pattern.name === 'ACCUMULATION') currentPhase = 'ACCUMULATION';
   else if (pattern && pattern.name === 'DISTRIBUTION') currentPhase = 'DISTRIBUTION';
   else if (pattern && pattern.name === 'STOP_HUNT') currentPhase = 'STOP HUNT';
   else if (smBuy > 70) currentPhase = 'MARKUP';
